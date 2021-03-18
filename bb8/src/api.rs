@@ -278,6 +278,11 @@ pub trait CustomizeConnection<C: Send + 'static, E: 'static>:
     async fn on_acquire(&self, _connection: &mut C) -> Result<(), E> {
         Ok(())
     }
+
+    /// TODO
+    async fn on_check_in(&self, _connection: &mut C) -> Result<(), E> {
+        Ok(())
+    }
 }
 
 /// A smart pointer wrapping a connection.
@@ -340,7 +345,10 @@ where
     M: ManageConnection,
 {
     fn drop(&mut self) {
-        self.pool.put_back(self.conn.take());
+        let pool = self.pool.clone();
+        let conn = self.conn.take();
+
+        tokio::spawn(async move { Box::pin(pool.put_back(conn)).await });
     }
 }
 

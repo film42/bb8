@@ -211,14 +211,15 @@ fn test_is_send_sync() {
 
 #[tokio::test]
 async fn test_drop_on_broken() {
-    static DROPPED: AtomicBool = AtomicBool::new(false);
-
-    #[derive(Default)]
-    struct Connection;
+    struct Connection {
+        sender: Option<oneshot::Sender<bool>>,
+        receiver: Option<oneshot::Receiver<bool>>,
+    }
 
     impl Drop for Connection {
         fn drop(&mut self) {
-            DROPPED.store(true, Ordering::SeqCst);
+            println!("It does happen.. just later");
+            self.sender.take().unwrap().send(true).unwrap();
         }
     }
 
@@ -230,7 +231,11 @@ async fn test_drop_on_broken() {
         type Error = Error;
 
         async fn connect(&self) -> Result<Self::Connection, Self::Error> {
-            Ok(Default::default())
+            let (sender, receiver) = oneshot::channel::<bool>();
+            Ok(Connection {
+                sender: Some(sender),
+                receiver: Some(receiver),
+            })
         }
 
         async fn is_valid(
@@ -246,11 +251,11 @@ async fn test_drop_on_broken() {
     }
 
     let pool = Pool::builder().build(Handler).await.unwrap();
-    {
-        let _ = pool.get().await.unwrap();
-    }
+    let mut conn = pool.get().await.unwrap();
+    let receiver = conn.receiver.take();
+    drop(conn);
 
-    assert!(DROPPED.load(Ordering::SeqCst));
+    assert!(receiver.unwrap().await.unwrap());
 }
 
 #[tokio::test]

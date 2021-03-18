@@ -40,7 +40,12 @@ where
     }
 
     pub(crate) async fn start_connections(&self) -> Result<(), M::Error> {
-        let wanted = self.inner.internals.lock().wanted(&self.inner.statics);
+        let wanted = self
+            .inner
+            .internals
+            .lock()
+            .await
+            .wanted(&self.inner.statics);
         let mut stream = self.replenish_idle_connections(wanted);
         while let Some(result) = stream.next().await {
             result?
@@ -49,7 +54,7 @@ where
     }
 
     pub(crate) fn spawn_start_connections(&self) {
-        let mut locked = self.inner.internals.lock();
+        let mut locked = futures_executor::block_on(async { self.inner.internals.lock().await });
         self.spawn_replenishing_approvals(locked.wanted(&self.inner.statics));
     }
 
@@ -85,7 +90,7 @@ where
     pub(crate) async fn get(&self) -> Result<PooledConnection<'_, M>, RunError<M::Error>> {
         loop {
             let mut conn = {
-                let mut locked = self.inner.internals.lock();
+                let mut locked = self.inner.internals.lock().await;
                 match locked.pop(&self.inner.statics) {
                     Some((conn, approvals)) => {
                         self.spawn_replenishing_approvals(approvals);
@@ -111,7 +116,7 @@ where
 
         let (tx, rx) = oneshot::channel();
         {
-            let mut locked = self.inner.internals.lock();
+            let mut locked = self.inner.internals.lock().await;
             let approvals = locked.push_waiter(tx, &self.inner.statics);
             self.spawn_replenishing_approvals(approvals);
         };
@@ -129,8 +134,8 @@ where
     }
 
     /// Return connection back in to the pool
-    pub(crate) fn put_back(&self, conn: Option<Conn<M::Connection>>) {
-        let conn = conn.and_then(|mut conn| {
+    pub(crate) async fn put_back(&self, conn: Option<Conn<M::Connection>>) {
+        let mut conn = conn.and_then(|mut conn| {
             if !self.inner.manager.has_broken(&mut conn.conn) {
                 Some(conn)
             } else {
@@ -138,9 +143,16 @@ where
             }
         });
 
-        let mut locked = self.inner.internals.lock();
+        if let Some(ref mut c) = conn {
+            if let Err(e) = self.on_check_in_connection(&mut c.conn).await {
+                self.inner.statics.error_sink.sink(e);
+                conn = None;
+            }
+        }
+
+        let mut locked = self.inner.internals.lock().await;
         match conn {
-            Some(conn) => locked.put(conn, None, self.inner.clone()),
+            Some(conn) => locked.put(conn, None, self.inner.clone()).await,
             None => {
                 let approvals = locked.dropped(1, &self.inner.statics);
                 self.spawn_replenishing_approvals(approvals);
@@ -150,11 +162,11 @@ where
 
     /// Returns information about the current state of the pool.
     pub(crate) fn state(&self) -> State {
-        self.inner.internals.lock().state()
+        futures_executor::block_on(async { self.inner.internals.lock().await.state() })
     }
 
     fn reap(&self) {
-        let mut internals = self.inner.internals.lock();
+        let mut internals = futures_executor::block_on(async { self.inner.internals.lock().await });
         let approvals = internals.reap(&self.inner.statics);
         self.spawn_replenishing_approvals(approvals);
     }
@@ -182,15 +194,13 @@ where
             match conn {
                 Ok(conn) => {
                     let conn = Conn::new(conn);
-                    shared
-                        .internals
-                        .lock()
-                        .put(conn, Some(approval), self.inner.clone());
+                    let mut locked = shared.internals.lock().await;
+                    locked.put(conn, Some(approval), self.inner.clone()).await;
                     return Ok(());
                 }
                 Err(e) => {
                     if Instant::now() - start > self.inner.statics.connection_timeout {
-                        let mut locked = shared.internals.lock();
+                        let mut locked = shared.internals.lock().await;
                         locked.connect_failed(approval);
                         return Err(e);
                     } else {
@@ -206,6 +216,13 @@ where
     async fn on_acquire_connection(&self, conn: &mut M::Connection) -> Result<(), M::Error> {
         match self.inner.statics.connection_customizer.as_ref() {
             Some(customizer) => customizer.on_acquire(conn).await,
+            None => Ok(()),
+        }
+    }
+
+    async fn on_check_in_connection(&self, conn: &mut M::Connection) -> Result<(), M::Error> {
+        match self.inner.statics.connection_customizer.as_ref() {
+            Some(customizer) => customizer.on_check_in(conn).await,
             None => Ok(()),
         }
     }

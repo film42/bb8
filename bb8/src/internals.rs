@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use futures_channel::oneshot;
-use parking_lot::Mutex;
+use tokio::sync::Mutex;
 
 use crate::api::{Builder, ManageConnection};
 use std::collections::VecDeque;
@@ -57,7 +57,7 @@ where
             .map(|idle| (idle.conn, self.wanted(config)))
     }
 
-    pub(crate) fn put(
+    pub(crate) async fn put(
         &mut self,
         conn: Conn<M::Connection>,
         approval: Option<Approval>,
@@ -188,8 +188,12 @@ impl<M: ManageConnection> InternalsGuard<M> {
 impl<M: ManageConnection> Drop for InternalsGuard<M> {
     fn drop(&mut self) {
         if let Some(conn) = self.conn.take() {
-            let mut locked = self.pool.internals.lock();
-            locked.put(conn, None, self.pool.clone());
+            let pool = self.pool.clone();
+
+            tokio::spawn(async move {
+                let mut locked = pool.internals.lock().await;
+                locked.put(conn, None, pool.clone()).await;
+            });
         }
     }
 }
